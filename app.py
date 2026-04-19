@@ -1,14 +1,11 @@
 import os
-from flask import Flask, request, jsonify, render_template_string
 import sqlite3
 import secrets
 import string
-from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime, timedelta
-import jwt
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'change-this-secret-key-in-production'
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
 def get_db_connection():
     conn = sqlite3.connect('earnlink.db')
@@ -20,8 +17,8 @@ def init_db():
     conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
+            telegram_id INTEGER UNIQUE NOT NULL,
+            username TEXT,
             referral_code TEXT UNIQUE NOT NULL,
             referred_by TEXT,
             points INTEGER DEFAULT 0
@@ -33,257 +30,116 @@ def init_db():
 def generate_referral_code():
     return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
 
-def create_token(email):
-    payload = {
-        'email': email,
-        'exp': datetime.utcnow() + timedelta(days=7)
-    }
-    return jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
-
-def verify_token(token):
-    try:
-        payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-        return payload['email']
-    except:
-        return None
-
-HTML = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>EarnLink</title>
-    <style>
-        body { font-family: Arial; max-width: 600px; margin: 40px auto; padding: 0 20px; }
-        input { width: 100%; padding: 8px; margin: 5px 0; }
-        button { padding: 10px; width: 100%; margin: 10px 0; cursor: pointer; }
-     .box { border: 1px solid #ddd; padding: 15px; margin: 15px 0; border-radius: 8px; }
-        table { width: 100%; border-collapse: collapse; }
-        td, th { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        #msg { color: green; min-height: 20px; }
-     .hidden { display: none; }
-    </style>
-</head>
-<body>
-    <h1>EarnLink</h1>
-
-    <div id="auth" class="box">
-        <h3>Signup / Login</h3>
-        <input id="email" placeholder="Email">
-        <input id="password" type="password" placeholder="Password">
-        <input id="referral" placeholder="Referral Code (optional)">
-        <button onclick="signup()">Signup</button>
-        <button onclick="login()">Login</button>
-        <div id="msg"></div>
-    </div>
-
-    <div id="dashboard" class="box hidden">
-        <h3>Welcome <span id="userEmail"></span></h3>
-        <p><b>Points:</b> <span id="points">0</span></p>
-        <p><b>Your Code:</b> <span id="myCode"></span></p>
-        <button onclick="copyLink()">Copy Referral Link</button>
-        <button onclick="logout()">Logout</button>
-    </div>
-
-    <div class="box">
-        <h3>Leaderboard</h3>
-        <table id="board"></table>
-    </div>
-
-<script>
-let token = localStorage.getItem('token');
-
-function showMsg(text, isError=false) {
-    document.getElementById('msg').style.color = isError? 'red' : 'green';
-    document.getElementById('msg').innerText = text;
-}
-
-async function signup() {
-    const res = await fetch('/signup', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            email: email.value,
-            password: password.value,
-            referral: referral.value
-        })
-    });
-    const data = await res.json();
-    if (res.status === 201) {
-        localStorage.setItem('token', data.token);
-        token = data.token;
-        loadMe();
-        showMsg('Signup success!');
-    } else {
-        showMsg(data.error, true);
-    }
-}
-
-async function login() {
-    const res = await fetch('/login', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            email: email.value,
-            password: password.value
-        })
-    });
-    const data = await res.json();
-    if (res.status === 200) {
-        localStorage.setItem('token', data.token);
-        token = data.token;
-        loadMe();
-        showMsg('Login success!');
-    } else {
-        showMsg(data.error, true);
-    }
-}
-
-async function loadMe() {
-    if (!token) return;
-    const res = await fetch('/me', {
-        headers: {'Authorization': 'Bearer ' + token}
-    });
-    if (res.status === 200) {
-        const data = await res.json();
-        document.getElementById('auth').classList.add('hidden');
-        document.getElementById('dashboard').classList.remove('hidden');
-        userEmail.innerText = data.email;
-        points.innerText = data.points;
-        myCode.innerText = data.referral_code;
-    } else {
-        logout();
-    }
-}
-
-function logout() {
-    localStorage.removeItem('token');
-    token = null;
-    document.getElementById('auth').classList.remove('hidden');
-    document.getElementById('dashboard').classList.add('hidden');
-}
-
-function copyLink() {
-    const link = window.location.origin + '/?ref=' + myCode.innerText;
-    navigator.clipboard.writeText(link);
-    showMsg('Copied: ' + link);
-    window.prompt('Copy your referral link:', link);
-}
-
-async function loadBoard() {
-    const res = await fetch('/leaderboard');
-    const data = await res.json();
-    let html = '<tr><th>#</th><th>Email</th><th>Points</th></tr>';
-    data.forEach((u, i) => {
-        html += `<tr><td>${i+1}</td><td>${u.email}</td><td>${u.points}</td></tr>`;
-    });
-    board.innerHTML = html;
-}
-
-// Auto-fill referral from URL
-const urlParams = new URLSearchParams(window.location.search);
-if (urlParams.get('ref')) {
-    referral.value = urlParams.get('ref');
-}
-
-loadMe();
-loadBoard();
-setInterval(loadBoard, 5000);
-</script>
-</body>
-</html>
-'''
-
-@app.route('/')
-def home():
-    return render_template_string(HTML)
-
-@app.route('/signup', methods=['POST'])
-def signup():
-    data = request.get_json()
-    if not data or not data.get('email') or not data.get('password'):
-        return jsonify({"error": "Email and password required"}), 400
-    email = data['email'].strip()
-    password = data['password']
-    referral = data.get('referral', '').strip()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    init_db()
+    user = update.effective_user
+    telegram_id = user.id
+    username = user.first_name or user.username or "User"
+    
+    # Check for referral code from /start ref_CODE
+    referred_by = None
+    if context.args and len(context.args) > 0:
+        referred_by = context.args[0]
+    
     conn = get_db_connection()
-    existing = conn.execute('SELECT id FROM users WHERE LOWER(email) = LOWER(?)', (email,)).fetchone()
+    
+    # Check if user exists
+    existing = conn.execute('SELECT * FROM users WHERE telegram_id =?', (telegram_id,)).fetchone()
+    
     if existing:
+        points = existing['points']
+        ref_code = existing['referral_code']
+        await update.message.reply_text(
+            f"Welcome back {username}! 👋\n\n"
+            f"Points: {points}\n"
+            f"Your referral code: `{ref_code}`\n"
+            f"Share link: t.me/EarnlinkMoneyBot?start={ref_code}\n\n"
+            f"Use /balance to check points\n"
+            f"Use /leaderboard to see top users",
+            parse_mode='Markdown'
+        )
         conn.close()
-        return jsonify({"error": "Email already registered"}), 400
-    referrer = None
-    if referral:
-        referrer = conn.execute('SELECT id, email, referral_code FROM users WHERE LOWER(TRIM(referral_code)) = LOWER(TRIM(?))', (referral,)).fetchone()
-        if not referrer:
-            conn.close()
-            return jsonify({"error": "Invalid referral code"}), 400
-        if referrer['email'].lower() == email.lower():
-            conn.close()
-            return jsonify({"error": "Cannot refer yourself"}), 400
+        return
+    
+    # New user signup
     new_code = generate_referral_code()
     while conn.execute('SELECT id FROM users WHERE referral_code =?', (new_code,)).fetchone():
         new_code = generate_referral_code()
-    hashed_password = generate_password_hash(password)
-    conn.execute('INSERT INTO users (email, password, referral_code, referred_by, points) VALUES (?,?,?,?, 0)', (email, hashed_password, new_code, referral if referral else None))
+    
+    # Validate referrer
+    referrer = None
+    if referred_by:
+        referrer = conn.execute('SELECT telegram_id FROM users WHERE referral_code =?', (referred_by,)).fetchone()
+        if referrer and referrer['telegram_id'] == telegram_id:
+            referred_by = None # Can't refer yourself
+            referrer = None
+    
+    # Insert new user
+    conn.execute(
+        'INSERT INTO users (telegram_id, username, referral_code, referred_by, points) VALUES (?,?,?,?, 0)',
+        (telegram_id, username, new_code, referred_by)
+    )
+    
+    # Give referrer 20 points
     if referrer:
-        conn.execute('UPDATE users SET points = points + 20 WHERE id =?', (referrer['id'],))
+        conn.execute('UPDATE users SET points = points + 20 WHERE telegram_id =?', (referrer['telegram_id'],))
+        try:
+            await context.bot.send_message(
+                chat_id=referrer['telegram_id'],
+                text=f"🎉 Someone used your code! +20 points"
+            )
+        except:
+            pass
+    
     conn.commit()
     conn.close()
-    token = create_token(email)
-    return jsonify({"message": "User created", "referral_code": new_code, "token": token}), 201
+    
+    msg = f"Hey {username}! 👋 Welcome to Earnlink!\n\nYour referral code: `{new_code}`\nShare link: t.me/EarnlinkMoneyBot?start={new_code}\n\nEarn 20 points per referral!"
+    if referred_by and referrer:
+        msg += "\n\n✅ Referral applied! Your referrer got 20 points."
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    if not data or not data.get('email') or not data.get('password'):
-        return jsonify({"error": "Email and password required"}), 400
-    email = data['email'].strip()
-    password = data['password']
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = update.effective_user.id
     conn = get_db_connection()
-    user = conn.execute('SELECT email, password, points, referral_code FROM users WHERE LOWER(email) = LOWER(?)', (email,)).fetchone()
+    user = conn.execute('SELECT points, referral_code FROM users WHERE telegram_id =?', (telegram_id,)).fetchone()
     conn.close()
-    if not user:
-        return jsonify({"error": "Invalid email or password"}), 401
-    if check_password_hash(user['password'], password):
-        token = create_token(user['email'])
-        return jsonify({"message": "Login success", "email": user['email'], "points": user['points'], "referral_code": user['referral_code'], "token": token}), 200
-    else:
-        return jsonify({"error": "Invalid email or password"}), 401
-
-@app.route('/me')
-def me():
-    auth_header = request.headers.get('Authorization')
-    if not auth_header or not auth_header.startswith('Bearer '):
-        return jsonify({"error": "Missing or invalid token"}), 401
-    token = auth_header.split(' ')[1]
-    email = verify_token(token)
-    if not email:
-        return jsonify({"error": "Invalid or expired token"}), 401
-    conn = get_db_connection()
-    user = conn.execute('SELECT email, points, referral_code FROM users WHERE LOWER(email) = LOWER(?)', (email,)).fetchone()
-    conn.close()
+    
     if user:
-        return jsonify(dict(user))
-    return jsonify({"error": "User not found"}), 404
+        await update.message.reply_text(
+            f"💰 Points: {user['points']}\n"
+            f"🔗 Code: `{user['referral_code']}`\n"
+            f"Share: t.me/EarnlinkMoneyBot?start={user['referral_code']}",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("Use /start first to register!")
 
-@app.route('/leaderboard')
-def leaderboard():
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
-    users = conn.execute('SELECT email, points, referral_code FROM users ORDER BY points DESC LIMIT 10').fetchall()
+    users = conn.execute('SELECT username, points FROM users ORDER BY points DESC LIMIT 10').fetchall()
     conn.close()
-    return jsonify([dict(u) for u in users])
+    
+    if not users:
+        await update.message.reply_text("No users yet. Be the first!")
+        return
+    
+    text = "🏆 **Leaderboard**\n\n"
+    for i, u in enumerate(users, 1):
+        name = u['username'] or "User"
+        text += f"{i}. {name} - {u['points']} pts\n"
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
 
-@app.route('/referrals/<email>')
-def get_referrals(email):
-    conn = get_db_connection()
-    user = conn.execute('SELECT referral_code FROM users WHERE LOWER(email) = LOWER(?)', (email,)).fetchone()
-    if not user:
-        conn.close()
-        return jsonify({"error": "User not found"}), 404
-    referrals = conn.execute('SELECT email, points FROM users WHERE LOWER(TRIM(referred_by)) = LOWER(TRIM(?))', (user['referral_code'],)).fetchall()
-    conn.close()
-    return jsonify({"referrer": email, "referral_code": user['referral_code'], "total_referrals": len(referrals), "referred_users": [dict(u) for u in referrals]})
+def main():
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("leaderboard", leaderboard))
+    print("Bot running...")
+    app.run_polling()
 
 if __name__ == '__main__':
-    init_db()
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    main()
