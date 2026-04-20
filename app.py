@@ -5,9 +5,26 @@ from flask import Flask, request, render_template_string, redirect, session, url
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 import urllib.parse
+import requests
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-change-this')
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+
+# PART 5: Fee config - change if you want
+WITHDRAWAL_FEE_PERCENT = 2 # 2% fee on withdrawals
+LEVEL_1_REWARD = 20 # Direct referral
+LEVEL_2_REWARD = 5 # Referral of referral
+
+def send_telegram(telegram_id, message):
+    if not TELEGRAM_TOKEN or not telegram_id:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": telegram_id, "text": message, "parse_mode": "HTML"}, timeout=5)
+        return True
+    except:
+        return False
 
 def get_db():
     DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -26,6 +43,7 @@ def init_db():
             referral_code TEXT UNIQUE,
             referred_by TEXT,
             momo_number TEXT,
+            telegram_id TEXT,
             join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -34,12 +52,23 @@ def init_db():
             id SERIAL PRIMARY KEY,
             user_id INTEGER,
             amount INTEGER,
+            fee INTEGER DEFAULT 0,
+            net_amount INTEGER,
             momo_number TEXT,
             status TEXT DEFAULT 'pending',
             request_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    # Add new columns if missing - safe migration
+    cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='telegram_id'")
+    if not cursor.fetchone():
+        cursor.execute("ALTER TABLE users ADD COLUMN telegram_id TEXT")
+    cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='fee'")
+    if not cursor.fetchone():
+        cursor.execute("ALTER TABLE withdrawals ADD COLUMN fee INTEGER DEFAULT 0")
+        cursor.execute("ALTER TABLE withdrawals ADD COLUMN net_amount INTEGER")
+
     cursor.execute("SELECT * FROM users WHERE email=%s", ('admin@test.com',))
     if cursor.fetchone() is None:
         hashed_pw = generate_password_hash('123')
@@ -72,6 +101,8 @@ BASE_HTML = '''
 .balance{font-size:24px;color:#28a745;font-weight:bold}
         table{width:100%;border-collapse:collapse}
         td,th{padding:8px;text-align:left;border-bottom:1px solid #ddd}
+.badge{padding:3px 8px;border-radius:3px;color:white;font-size:12px}
+.small{font-size:12px;color:#666}
     </style>
 </head>
 <body>
@@ -79,6 +110,8 @@ BASE_HTML = '''
         <a href="/">Dashboard</a>
         <a href="/leaderboard">Leaderboard</a>
         <a href="/withdraw">Withdraw</a>
+        <a href="/history">History</a>
+        <a href="/settings">Settings</a>
         {% if session.user_id and is_admin %}<a href="/admin">Admin</a>{% endif %}
         {% if session.user_id %}<a href="/logout">Logout</a>{% endif %}
     </div>
@@ -115,8 +148,7 @@ def home():
     conn.close()
 
     link = f"{request.host_url}join/{user['referral_code']}"
-    # PART 2: WhatsApp share text - URL encoded
-    wa_text = urllib.parse.quote(f"🔥 Join EarnLink and we both get 20 FCFA! Free money in Cameroon 💰\n\nUse my link: {link}")
+    wa_text = urllib.parse.quote(f"🔥 Join EarnLink and we both get 20 FCFA! Level 2 = 5 FCFA bonus 💰\n\nUse my link: {link}")
     wa_link = f"https://wa.me/?text={wa_text}"
 
     content = f'''
@@ -124,15 +156,52 @@ def home():
         <h1>Welcome {user['email']}</h1>
         <p>Your Balance:</p>
         <p class="balance">{user['points']} Points</p>
-        <p>1 point = 1 FCFA | Min withdrawal: 100 points</p>
+        <p>1 point = 1 FCFA | Min withdrawal: 100 points | Fee: {WITHDRAWAL_FEE_PERCENT}%</p>
     </div>
     <div class="card">
         <h3>🔗 Your Referral Link</h3>
         <input value="{link}" readonly onclick="this.select()">
-        <p>Share this link. You get 20 points per friend who joins!</p>
+        <p>Level 1: {LEVEL_1_REWARD} pts | Level 2: {LEVEL_2_REWARD} pts per friend</p>
         <a href="{wa_link}" class="btn btn-whatsapp" target="_blank">📲 Share on WhatsApp</a>
         <a href="/leaderboard" class="btn">🏆 Leaderboard</a>
         <a href="/withdraw" class="btn btn-green">💰 Withdraw</a>
+        <a href="/history" class="btn">📋 History</a>
+    </div>
+    '''
+    return render_page(content)
+
+@app.route('/settings', methods=['GET','POST'])
+def settings():
+    if 'user_id' not in session:
+        return redirect('/login')
+
+    if request.method == 'POST':
+        telegram_id = request.form.get('telegram_id', '').strip()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('UPDATE users SET telegram_id=%s WHERE id=%s', (telegram_id if telegram_id else None, session['user_id']))
+        conn.commit()
+        conn.close()
+        flash('Telegram ID saved! You will get payout notifications.')
+        return redirect('/settings')
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT telegram_id FROM users WHERE id=%s', (session['user_id'],))
+    user = cur.fetchone()
+    conn.close()
+
+    content = f'''
+    <div class="card">
+        <h1>⚙️ Settings</h1>
+        <h3>Telegram Notifications</h3>
+        <p class="small">Get instant DM when your withdrawal is paid.</p>
+        <p class="small">1. Open Telegram → Search @userinfobot → Send /start → Copy your ID</p>
+        <p class="small">2. Start a chat with @earnlink_payouts_bot → Send /start</p>
+        <form method="post">
+            <input name="telegram_id" placeholder="Your Telegram ID: 123456789" value="{user['telegram_id'] or ''}">
+            <button class="btn" type="submit">Save Telegram ID</button>
+        </form>
     </div>
     '''
     return render_page(content)
@@ -185,11 +254,19 @@ def register():
             code = make_code(user_id)
             cur.execute('UPDATE users SET referral_code=%s WHERE id=%s', (code, user_id))
 
+            # PART 5: 2-LEVEL REFERRAL SYSTEM
             if ref:
-                cur.execute('SELECT id FROM users WHERE referral_code=%s', (ref,))
-                referrer = cur.fetchone()
-                if referrer:
-                    cur.execute('UPDATE users SET points = points + 20 WHERE id=%s', (referrer['id'],))
+                # Level 1: Direct referrer gets 20
+                cur.execute('SELECT id, referred_by FROM users WHERE referral_code=%s', (ref,))
+                level1 = cur.fetchone()
+                if level1:
+                    cur.execute('UPDATE users SET points = points + %s WHERE id=%s', (LEVEL_1_REWARD, level1['id']))
+                    # Level 2: Referrer's referrer gets 5
+                    if level1['referred_by']:
+                        cur.execute('SELECT id FROM users WHERE referral_code=%s', (level1['referred_by'],))
+                        level2 = cur.fetchone()
+                        if level2:
+                            cur.execute('UPDATE users SET points = points + %s WHERE id=%s', (LEVEL_2_REWARD, level2['id']))
 
             conn.commit()
             session['user_id'] = user_id
@@ -249,25 +326,75 @@ def withdraw():
             conn.close()
             return redirect('/withdraw')
 
+        # PART 5: Calculate 2% fee
+        fee = (amount * WITHDRAWAL_FEE_PERCENT) // 100
+        net_amount = amount - fee
+
         cur.execute('UPDATE users SET points = points - %s, momo_number = %s WHERE id = %s',
                      (amount, momo, session['user_id']))
-        cur.execute('INSERT INTO withdrawals (user_id, amount, momo_number) VALUES (%s,%s,%s)',
-                     (session['user_id'], amount, momo))
+        cur.execute('INSERT INTO withdrawals (user_id, amount, fee, net_amount, momo_number) VALUES (%s,%s,%s)',
+                     (session['user_id'], amount, fee, net_amount, momo))
         conn.commit()
-        flash(f'Withdrawal of {amount} FCFA requested. Paid within 24h.')
+        flash(f'Withdrawal of {net_amount} FCFA requested. Fee: {fee} FCFA. Paid within 24h.')
         conn.close()
         return redirect('/withdraw')
 
     conn.close()
     content = f'''
     <div class="card">
-        <h1>💰 Withdraw V3 - SECURE</h1>
+        <h1>💰 Withdraw V5 - FEES + LEVELS</h1>
         <p>Current Balance: <b>{user['points']} points</b></p>
+        <p class="small">Fee: {WITHDRAWAL_FEE_PERCENT}% deducted. You receive 98% of amount.</p>
         <form method="post">
             <input name="amount" type="number" placeholder="Amount (min 100)" min="100" max="{user['points']}" required>
             <input name="momo" placeholder="MTN MoMo Number: 677123456" required>
             <button class="btn btn-green" type="submit">Request Withdrawal</button>
         </form>
+        <p><a href="/history">View history</a> | <a href="/settings">Setup Telegram alerts</a></p>
+    </div>
+    '''
+    return render_page(content)
+
+@app.route('/history')
+def history():
+    if 'user_id' not in session:
+        return redirect('/login')
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('''
+        SELECT amount, fee, net_amount, momo_number, status, request_date
+        FROM withdrawals
+        WHERE user_id=%s
+        ORDER BY request_date DESC
+    ''', (session['user_id'],))
+    withdrawals = cur.fetchall()
+    conn.close()
+
+    rows = ''
+    for w in withdrawals:
+        if w['status'] == 'paid':
+            badge = '<span class="badge" style="background:#28a745">Paid</span>'
+        else:
+            badge = '<span class="badge" style="background:#ffc107">Pending</span>'
+        rows += f'''
+        <tr>
+            <td>{w['net_amount']} FCFA</td>
+            <td class="small">Fee: {w['fee']}</td>
+            <td>{w['momo_number']}</td>
+            <td>{badge}</td>
+            <td>{w['request_date'].strftime('%Y-%m-%d %H:%M')}</td>
+        </tr>
+        '''
+
+    content = f'''
+    <div class="card">
+        <h1>📋 Withdrawal History</h1>
+        <table>
+            <tr><th>Net Amount</th><th>Fee</th><th>MoMo</th><th>Status</th><th>Date</th></tr>
+            {rows if rows else '<tr><td colspan="5">No withdrawals yet</td></tr>'}
+        </table>
+        <p><a href="/withdraw" class="btn btn-green">New Withdrawal</a></p>
     </div>
     '''
     return render_page(content)
@@ -309,7 +436,7 @@ def admin():
         return redirect('/')
 
     cur.execute('''
-        SELECT w.id, w.amount, w.momo_number, w.status, w.request_date, u.email
+        SELECT w.id, w.amount, w.fee, w.net_amount, w.momo_number, w.status, w.request_date, u.email
         FROM withdrawals w
         JOIN users u ON w.user_id = u.id
         ORDER BY w.request_date DESC
@@ -325,9 +452,10 @@ def admin():
         <tr>
             <td>{w['id']}</td>
             <td>{w['email']}</td>
-            <td>{w['amount']} FCFA</td>
+            <td>{w['net_amount']} FCFA</td>
+            <td class="small">Fee: {w['fee']}</td>
             <td>{w['momo_number']}</td>
-            <td><span style="background:{status_color};color:white;padding:3px 8px;border-radius:3px">{w['status']}</span></td>
+            <td><span class="badge" style="background:{status_color}">{w['status']}</span></td>
             <td>{w['request_date'].strftime('%Y-%m-%d %H:%M')}</td>
             <td>{action}</td>
         </tr>
@@ -336,9 +464,10 @@ def admin():
     content = f'''
     <div class="card">
         <h1>🔒 Admin Panel - Withdrawals</h1>
+        <p class="small">Platform earns {WITHDRAWAL_FEE_PERCENT}% on each withdrawal</p>
         <table>
-            <tr><th>ID</th><th>User</th><th>Amount</th><th>MoMo</th><th>Status</th><th>Date</th><th>Action</th></tr>
-            {rows if rows else '<tr><td colspan="7">No withdrawal requests yet</td></tr>'}
+            <tr><th>ID</th><th>User</th><th>Net Pay</th><th>Fee</th><th>MoMo</th><th>Status</th><th>Date</th><th>Action</th></tr>
+            {rows if rows else '<tr><td colspan="8">No withdrawal requests yet</td></tr>'}
         </table>
     </div>
     '''
@@ -359,10 +488,25 @@ def pay(wid):
         flash('Access denied')
         return redirect('/')
 
+    cur.execute('''
+        SELECT w.net_amount, u.telegram_id, u.email
+        FROM withdrawals w
+        JOIN users u ON w.user_id = u.id
+        WHERE w.id=%s
+    ''', (wid,))
+    w_data = cur.fetchone()
+
     cur.execute('UPDATE withdrawals SET status=%s WHERE id=%s', ('paid', wid))
     conn.commit()
     conn.close()
-    flash(f'Withdrawal #{wid} marked as paid')
+
+    if w_data and w_data['telegram_id']:
+        msg = f"✅ <b>EarnLink Payout Complete</b>\n\nYour withdrawal of <b>{w_data['net_amount']} FCFA</b> has been paid to your MoMo.\n\nThanks for using EarnLink!"
+        send_telegram(w_data['telegram_id'], msg)
+        flash(f'Withdrawal #{wid} marked as paid + Telegram sent to {w_data["email"]}')
+    else:
+        flash(f'Withdrawal #{wid} marked as paid')
+
     return redirect('/admin')
 
 @app.route('/logout')
