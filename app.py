@@ -4,6 +4,7 @@ from psycopg2.extras import DictCursor
 from flask import Flask, request, render_template_string, redirect, session, url_for, flash
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
+import urllib.parse
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-change-this')
@@ -39,7 +40,6 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
-    # Create admin if not exists - with hashed password
     cursor.execute("SELECT * FROM users WHERE email=%s", ('admin@test.com',))
     if cursor.fetchone() is None:
         hashed_pw = generate_password_hash('123')
@@ -53,7 +53,6 @@ init_db()
 def make_code(user_id):
     return f"EL{user_id}"
 
-# HTML TEMPLATE - All pages in one
 BASE_HTML = '''
 <!DOCTYPE html>
 <html>
@@ -62,14 +61,15 @@ BASE_HTML = '''
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f5f5f5}
- .card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
- .btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
- .btn-red{background:#dc3545}
- .btn-green{background:#28a745}
+.card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
+.btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
+.btn-red{background:#dc3545}
+.btn-green{background:#28a745}
+.btn-whatsapp{background:#25D366}
         input{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
- .nav a{margin-right:15px;text-decoration:none;color:#0088cc}
+.nav a{margin-right:15px;text-decoration:none;color:#0088cc}
         h1{color:#333;margin-top:0}
- .balance{font-size:24px;color:#28a745;font-weight:bold}
+.balance{font-size:24px;color:#28a745;font-weight:bold}
         table{width:100%;border-collapse:collapse}
         td,th{padding:8px;text-align:left;border-bottom:1px solid #ddd}
     </style>
@@ -115,6 +115,9 @@ def home():
     conn.close()
 
     link = f"{request.host_url}join/{user['referral_code']}"
+    # PART 2: WhatsApp share text - URL encoded
+    wa_text = urllib.parse.quote(f"🔥 Join EarnLink and we both get 20 FCFA! Free money in Cameroon 💰\n\nUse my link: {link}")
+    wa_link = f"https://wa.me/?text={wa_text}"
 
     content = f'''
     <div class="card">
@@ -127,6 +130,7 @@ def home():
         <h3>🔗 Your Referral Link</h3>
         <input value="{link}" readonly onclick="this.select()">
         <p>Share this link. You get 20 points per friend who joins!</p>
+        <a href="{wa_link}" class="btn btn-whatsapp" target="_blank">📲 Share on WhatsApp</a>
         <a href="/leaderboard" class="btn">🏆 Leaderboard</a>
         <a href="/withdraw" class="btn btn-green">💰 Withdraw</a>
     </div>
@@ -144,7 +148,6 @@ def login():
         user = cur.fetchone()
         conn.close()
 
-        # PASSWORD HASH CHECK - Part 1 upgrade
         if user and check_password_hash(user['password'], password):
             session['user_id'] = user['id']
             return redirect('/')
@@ -171,7 +174,6 @@ def register():
         password = request.form['password']
         ref = request.args.get('ref')
 
-        # HASH THE PASSWORD - Part 1 upgrade
         hashed_pw = generate_password_hash(password)
 
         conn = get_db()
@@ -183,7 +185,6 @@ def register():
             code = make_code(user_id)
             cur.execute('UPDATE users SET referral_code=%s WHERE id=%s', (code, user_id))
 
-            # Give referrer 20 points
             if ref:
                 cur.execute('SELECT id FROM users WHERE referral_code=%s', (ref,))
                 referrer = cur.fetchone()
