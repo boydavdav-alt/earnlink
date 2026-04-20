@@ -6,18 +6,24 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import urllib.parse
 import requests
+import secrets
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-change-this')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+SENDGRID_KEY = os.environ.get('SENDGRID_API_KEY')
+FROM_EMAIL = os.environ.get('FROM_EMAIL', 'noreply@earnlink.cm')
 
-# PART 5 + 6 CONFIG
+# CONFIG
 WITHDRAWAL_FEE_PERCENT = 2
 LEVEL_1_REWARD = 20
 LEVEL_2_REWARD = 5
-MAX_WITHDRAWS_PER_DAY = 1 # PART 6: Anti-spam
+MAX_WITHDRAWS_PER_DAY = 1
 MIN_WITHDRAW = 100
-MAX_WITHDRAW = 5000 # PART 6: Cap single withdrawal
+MAX_WITHDRAW = 5000
+RESET_TOKEN_EXPIRE_HOURS = 1 # PART 7
 
 def send_telegram(telegram_id, message):
     if not TELEGRAM_TOKEN or not telegram_id:
@@ -25,6 +31,18 @@ def send_telegram(telegram_id, message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": telegram_id, "text": message, "parse_mode": "HTML"}, timeout=5)
+        return True
+    except:
+        return False
+
+# PART 7: SendGrid email function
+def send_email(to_email, subject, html_content):
+    if not SENDGRID_KEY:
+        return False
+    try:
+        message = Mail(from_email=FROM_EMAIL, to_emails=to_email, subject=subject, html_content=html_content)
+        sg = SendGridAPIClient(SENDGRID_KEY)
+        sg.send(message)
         return True
     except:
         return False
@@ -47,6 +65,8 @@ def init_db():
             referred_by TEXT,
             momo_number TEXT,
             telegram_id TEXT,
+            reset_token TEXT,
+            reset_expires TIMESTAMP,
             join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -63,9 +83,14 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    # Safe migrations
     cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='telegram_id'")
     if not cursor.fetchone():
         cursor.execute("ALTER TABLE users ADD COLUMN telegram_id TEXT")
+    cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='reset_token'")
+    if not cursor.fetchone():
+        cursor.execute("ALTER TABLE users ADD COLUMN reset_token TEXT")
+        cursor.execute("ALTER TABLE users ADD COLUMN reset_expires TIMESTAMP")
     cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='fee'")
     if not cursor.fetchone():
         cursor.execute("ALTER TABLE withdrawals ADD COLUMN fee INTEGER DEFAULT 0")
@@ -115,7 +140,7 @@ BASE_HTML = '''
         <a href="/history">History</a>
         <a href="/settings">Settings</a>
         {% if session.user_id and is_admin %}<a href="/admin">Admin</a>{% endif %}
-        {% if session.user_id %}<a href="/logout">Logout</a>{% endif %}
+        {% if session.user_id %}<a href="/logout">Logout</a>{% else %}<a href="/login">Login</a>{% endif %}
     </div>
     {% with messages = get_flashed_messages() %}
       {% if messages %}<div class="card" style="background:#fff3cd;">{{ messages[0] }}</div>{% endif %}
@@ -233,7 +258,89 @@ def login():
             <input name="password" type="password" placeholder="Password" required>
             <button class="btn" type="submit">Login</button>
         </form>
+        <p><a href="/forgot">Forgot Password?</a></p>
         <p>New here? <a href="/register">Create account</a></p>
+    </div>
+    '''
+    return render_page(content)
+
+# PART 7: FORGOT PASSWORD
+@app.route('/forgot', methods=['GET','POST'])
+def forgot():
+    if request.method == 'POST':
+        email = request.form['email']
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT id FROM users WHERE email=%s', (email,))
+        user = cur.fetchone()
+
+        if user:
+            token = secrets.token_urlsafe(32)
+            expires = datetime.utcnow() + timedelta(hours=RESET_TOKEN_EXPIRE_HOURS)
+            cur.execute('UPDATE users SET reset_token=%s, reset_expires=%s WHERE id=%s', (token, expires, user['id']))
+            conn.commit()
+
+            reset_link = f"{request.host_url}reset/{token}"
+            html = f'''
+            <h2>EarnLink Password Reset</h2>
+            <p>Click below to reset your password. Link expires in {RESET_TOKEN_EXPIRE_HOURS} hour.</p>
+            <a href="{reset_link}" style="background:#0088cc;color:white;padding:10px 20px;text-decoration:none;border-radius:5px">Reset Password</a>
+            <p>If you didn't request this, ignore this email.</p>
+            '''
+            if send_email(email, 'EarnLink Password Reset', html):
+                flash('Reset link sent! Check your email.')
+            else:
+                flash('Email service error. Contact admin.')
+        else:
+            flash('If that email exists, a reset link was sent.')
+
+        conn.close()
+        return redirect('/login')
+
+    content = '''
+    <div class="card">
+        <h1>Forgot Password</h1>
+        <p>Enter your email to get a reset link.</p>
+        <form method="post">
+            <input name="email" type="email" placeholder="Your email" required>
+            <button class="btn" type="submit">Send Reset Link</button>
+        </form>
+        <p><a href="/login">Back to Login</a></p>
+    </div>
+    '''
+    return render_page(content)
+
+# PART 7: RESET PASSWORD WITH TOKEN
+@app.route('/reset/<token>', methods=['GET','POST'])
+def reset(token):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT id, reset_expires FROM users WHERE reset_token=%s', (token,))
+    user = cur.fetchone()
+
+    if not user or user['reset_expires'] < datetime.utcnow():
+        conn.close()
+        flash('Invalid or expired reset link.')
+        return redirect('/login')
+
+    if request.method == 'POST':
+        new_pw = request.form['password']
+        hashed_pw = generate_password_hash(new_pw)
+        cur.execute('UPDATE users SET password=%s, reset_token=NULL, reset_expires=NULL WHERE id=%s',
+                    (hashed_pw, user['id']))
+        conn.commit()
+        conn.close()
+        flash('Password updated! Login with new password.')
+        return redirect('/login')
+
+    conn.close()
+    content = '''
+    <div class="card">
+        <h1>Set New Password</h1>
+        <form method="post">
+            <input name="password" type="password" placeholder="New password" required>
+            <button class="btn" type="submit">Update Password</button>
+        </form>
     </div>
     '''
     return render_page(content)
@@ -302,7 +409,6 @@ def withdraw():
     cur.execute('SELECT points FROM users WHERE id=%s', (session['user_id'],))
     user = cur.fetchone()
 
-    # PART 6: Check daily withdrawal limit
     cur.execute('''
         SELECT COUNT(*) as cnt FROM withdrawals
         WHERE user_id=%s AND request_date > NOW() - INTERVAL '24 hours'
@@ -310,7 +416,6 @@ def withdraw():
     withdraw_count = cur.fetchone()['cnt']
 
     if request.method == 'POST':
-        # PART 6: Block if limit reached
         if withdraw_count >= MAX_WITHDRAWS_PER_DAY:
             flash(f'Daily limit reached. Max {MAX_WITHDRAWS_PER_DAY} withdrawal per 24 hours.')
             conn.close()
@@ -347,7 +452,7 @@ def withdraw():
 
         cur.execute('UPDATE users SET points = points - %s, momo_number = %s WHERE id = %s',
                      (amount, momo, session['user_id']))
-        cur.execute('INSERT INTO withdrawals (user_id, amount, fee, net_amount, momo_number) VALUES (%s,%s,%s,%s,%s)',
+        cur.execute('INSERT INTO withdrawals (user_id, amount, fee, net_amount, momo_number) VALUES (%s,%s,%s)',
                      (session['user_id'], amount, fee, net_amount, momo))
         conn.commit()
         flash(f'Withdrawal of {net_amount} FCFA requested. Fee: {fee} FCFA. Paid within 24h.')
@@ -359,7 +464,7 @@ def withdraw():
 
     content = f'''
     <div class="card">
-        <h1>💰 Withdraw V6 - DAILY LIMIT</h1>
+        <h1>💰 Withdraw V7 - RESET EMAIL</h1>
         <p>Current Balance: <b>{user['points']} points</b></p>
         <p class="small">Min: {MIN_WITHDRAW} | Max: {MAX_WITHDRAW} | Fee: {WITHDRAWAL_FEE_PERCENT}%</p>
         {limit_msg}
@@ -461,7 +566,6 @@ def admin():
     ''')
     withdrawals = cur.fetchall()
 
-    # PART 6: Calculate total fees earned
     cur.execute("SELECT COALESCE(SUM(fee), 0) as total_fees FROM withdrawals WHERE status='paid'")
     total_fees = cur.fetchone()['total_fees']
     conn.close()
