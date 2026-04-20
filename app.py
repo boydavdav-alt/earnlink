@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import urllib.parse
 import requests
 import secrets
+import uuid
+import base64
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 
@@ -16,14 +18,66 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 SENDGRID_KEY = os.environ.get('SENDGRID_API_KEY')
 FROM_EMAIL = os.environ.get('FROM_EMAIL', 'noreply@earnlink.cm')
 
-# CONFIG
+# MTN MOMO API CONFIG - PART 8
+MTN_USER_ID = os.environ.get('MTN_USER_ID')
+MTN_API_KEY = os.environ.get('MTN_API_KEY')
+MTN_SUBSCRIPTION_KEY = os.environ.get('MTN_SUBSCRIPTION_KEY')
+MTN_TARGET_ENV = os.environ.get('MTN_TARGET_ENV', 'sandbox') # sandbox or production
+MTN_BASE_URL = 'https://sandbox.momodeveloper.mtn.com' if MTN_TARGET_ENV == 'sandbox' else 'https://proxy.momoapi.mtn.com'
+
+# APP CONFIG
 WITHDRAWAL_FEE_PERCENT = 2
 LEVEL_1_REWARD = 20
 LEVEL_2_REWARD = 5
 MAX_WITHDRAWS_PER_DAY = 1
 MIN_WITHDRAW = 100
 MAX_WITHDRAW = 5000
-RESET_TOKEN_EXPIRE_HOURS = 1 # PART 7
+RESET_TOKEN_EXPIRE_HOURS = 1
+
+# PART 8: MTN MoMo Auto-Pay Function
+def get_momo_token():
+    if not all([MTN_USER_ID, MTN_API_KEY, MTN_SUBSCRIPTION_KEY]):
+        return None
+    try:
+        auth = base64.b64encode(f"{MTN_USER_ID}:{MTN_API_KEY}".encode()).decode()
+        headers = {
+            'Authorization': f'Basic {auth}',
+            'Ocp-Apim-Subscription-Key': MTN_SUBSCRIPTION_KEY
+        }
+        r = requests.post(f'{MTN_BASE_URL}/collection/token/', headers=headers, timeout=10)
+        return r.json().get('access_token') if r.status_code == 200 else None
+    except:
+        return None
+
+def send_momo_payment(amount, phone_number, external_id):
+    token = get_momo_token()
+    if not token:
+        return False, "MTN API not configured"
+
+    # MTN requires phone format: 237XXXXXXXXX
+    if not phone_number.startswith('237'):
+        phone_number = f"237{phone_number.lstrip('0')}"
+
+    try:
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'X-Reference-Id': external_id,
+            'X-Target-Environment': MTN_TARGET_ENV,
+            'Ocp-Apim-Subscription-Key': MTN_SUBSCRIPTION_KEY,
+            'Content-Type': 'application/json'
+        }
+        body = {
+            "amount": str(amount),
+            "currency": "EUR" if MTN_TARGET_ENV == 'sandbox' else "XAF",
+            "externalId": external_id,
+            "payer": {"partyIdType": "MSISDN", "partyId": phone_number},
+            "payerMessage": "EarnLink Payout",
+            "payeeNote": "Thanks for using EarnLink"
+        }
+        r = requests.post(f'{MTN_BASE_URL}/collection/v1_0/requesttopay', headers=headers, json=body, timeout=15)
+        return r.status_code == 202, f"Status: {r.status_code}"
+    except Exception as e:
+        return False, str(e)
 
 def send_telegram(telegram_id, message):
     if not TELEGRAM_TOKEN or not telegram_id:
@@ -35,7 +89,6 @@ def send_telegram(telegram_id, message):
     except:
         return False
 
-# PART 7: SendGrid email function
 def send_email(to_email, subject, html_content):
     if not SENDGRID_KEY:
         return False
@@ -67,6 +120,7 @@ def init_db():
             telegram_id TEXT,
             reset_token TEXT,
             reset_expires TIMESTAMP,
+            signup_ip TEXT,
             join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -79,22 +133,25 @@ def init_db():
             net_amount INTEGER,
             momo_number TEXT,
             status TEXT DEFAULT 'pending',
+            momo_ref TEXT,
             request_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
     # Safe migrations
-    cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='telegram_id'")
-    if not cursor.fetchone():
-        cursor.execute("ALTER TABLE users ADD COLUMN telegram_id TEXT")
-    cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='reset_token'")
-    if not cursor.fetchone():
-        cursor.execute("ALTER TABLE users ADD COLUMN reset_token TEXT")
-        cursor.execute("ALTER TABLE users ADD COLUMN reset_expires TIMESTAMP")
-    cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='withdrawals' AND column_name='fee'")
-    if not cursor.fetchone():
-        cursor.execute("ALTER TABLE withdrawals ADD COLUMN fee INTEGER DEFAULT 0")
-        cursor.execute("ALTER TABLE withdrawals ADD COLUMN net_amount INTEGER")
+    for col, sql in [
+        ('telegram_id', "ALTER TABLE users ADD COLUMN telegram_id TEXT"),
+        ('reset_token', "ALTER TABLE users ADD COLUMN reset_token TEXT"),
+        ('reset_expires', "ALTER TABLE users ADD COLUMN reset_expires TIMESTAMP"),
+        ('signup_ip', "ALTER TABLE users ADD COLUMN signup_ip TEXT"),
+        ('fee', "ALTER TABLE withdrawals ADD COLUMN fee INTEGER DEFAULT 0"),
+        ('net_amount', "ALTER TABLE withdrawals ADD COLUMN net_amount INTEGER"),
+        ('momo_ref', "ALTER TABLE withdrawals ADD COLUMN momo_ref TEXT")
+    ]:
+        table = 'users' if col in ['telegram_id', 'reset_token', 'reset_expires', 'signup_ip'] else 'withdrawals'
+        cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name='{table}' AND column_name='{col}'")
+        if not cursor.fetchone():
+            cursor.execute(sql)
 
     cursor.execute("SELECT * FROM users WHERE email=%s", ('admin@test.com',))
     if cursor.fetchone() is None:
@@ -264,7 +321,6 @@ def login():
     '''
     return render_page(content)
 
-# PART 7: FORGOT PASSWORD
 @app.route('/forgot', methods=['GET','POST'])
 def forgot():
     if request.method == 'POST':
@@ -310,7 +366,6 @@ def forgot():
     '''
     return render_page(content)
 
-# PART 7: RESET PASSWORD WITH TOKEN
 @app.route('/reset/<token>', methods=['GET','POST'])
 def reset(token):
     conn = get_db()
@@ -351,28 +406,36 @@ def register():
         email = request.form['email']
         password = request.form['password']
         ref = request.args.get('ref')
+        signup_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
 
         hashed_pw = generate_password_hash(password)
 
         conn = get_db()
         try:
             cur = conn.cursor()
-            cur.execute('INSERT INTO users (email, password, referred_by) VALUES (%s,%s,%s) RETURNING id',
-                        (email, hashed_pw, ref))
+            cur.execute('INSERT INTO users (email, password, referred_by, signup_ip) VALUES (%s,%s,%s,%s) RETURNING id',
+                        (email, hashed_pw, ref, signup_ip))
             user_id = cur.fetchone()['id']
             code = make_code(user_id)
             cur.execute('UPDATE users SET referral_code=%s WHERE id=%s', (code, user_id))
 
+            # PART 8: REFERRAL FRAUD DETECTION
             if ref:
-                cur.execute('SELECT id, referred_by FROM users WHERE referral_code=%s', (ref,))
+                cur.execute('SELECT id, referred_by, signup_ip FROM users WHERE referral_code=%s', (ref,))
                 level1 = cur.fetchone()
                 if level1:
-                    cur.execute('UPDATE users SET points = points + %s WHERE id=%s', (LEVEL_1_REWARD, level1['id']))
-                    if level1['referred_by']:
-                        cur.execute('SELECT id FROM users WHERE referral_code=%s', (level1['referred_by'],))
-                        level2 = cur.fetchone()
-                        if level2:
-                            cur.execute('UPDATE users SET points = points + %s WHERE id=%s', (LEVEL_2_REWARD, level2['id']))
+                    # Block if self-referral or same IP
+                    if level1['id'] == user_id:
+                        pass # Self-referral blocked
+                    elif level1['signup_ip'] == signup_ip:
+                        pass # Same IP blocked - likely same person
+                    else:
+                        cur.execute('UPDATE users SET points = points + %s WHERE id=%s', (LEVEL_1_REWARD, level1['id']))
+                        if level1['referred_by']:
+                            cur.execute('SELECT id FROM users WHERE referral_code=%s', (level1['referred_by'],))
+                            level2 = cur.fetchone()
+                            if level2 and level2['id']!= user_id:
+                                cur.execute('UPDATE users SET points = points + %s WHERE id=%s', (LEVEL_2_REWARD, level2['id']))
 
             conn.commit()
             session['user_id'] = user_id
@@ -452,10 +515,11 @@ def withdraw():
 
         cur.execute('UPDATE users SET points = points - %s, momo_number = %s WHERE id = %s',
                      (amount, momo, session['user_id']))
-        cur.execute('INSERT INTO withdrawals (user_id, amount, fee, net_amount, momo_number) VALUES (%s,%s,%s)',
+        cur.execute('INSERT INTO withdrawals (user_id, amount, fee, net_amount, momo_number) VALUES (%s,%s,%s,%s,%s) RETURNING id',
                      (session['user_id'], amount, fee, net_amount, momo))
+        wid = cur.fetchone()['id']
         conn.commit()
-        flash(f'Withdrawal of {net_amount} FCFA requested. Fee: {fee} FCFA. Paid within 24h.')
+        flash(f'Withdrawal of {net_amount} FCFA requested. Fee: {fee} FCFA. Auto-pay processing.')
         conn.close()
         return redirect('/withdraw')
 
@@ -464,14 +528,14 @@ def withdraw():
 
     content = f'''
     <div class="card">
-        <h1>💰 Withdraw V7 - RESET EMAIL</h1>
+        <h1>💰 Withdraw V8 - AUTO-PAY</h1>
         <p>Current Balance: <b>{user['points']} points</b></p>
-        <p class="small">Min: {MIN_WITHDRAW} | Max: {MAX_WITHDRAW} | Fee: {WITHDRAWAL_FEE_PERCENT}%</p>
+        <p class="small">Min: {MIN_WITHDRAW} | Max: {MAX_WITHDRAW} | Fee: {WITHDRAWAL_FEE_PERCENT}% | Auto-paid via MTN MoMo</p>
         {limit_msg}
         <form method="post">
             <input name="amount" type="number" placeholder="Amount ({MIN_WITHDRAW}-{MAX_WITHDRAW})" min="{MIN_WITHDRAW}" max="{min(MAX_WITHDRAW, user['points'])}" required {'disabled' if withdraw_count >= MAX_WITHDRAWS_PER_DAY else ''}>
             <input name="momo" placeholder="MTN MoMo Number: 677123456" required {'disabled' if withdraw_count >= MAX_WITHDRAWS_PER_DAY else ''}>
-            <button class="btn btn-green" type="submit" {'disabled' if withdraw_count >= MAX_WITHDRAWS_PER_DAY else ''}>Request Withdrawal</button>
+            <button class="btn btn-green" type="submit" {'disabled' if withdraw_count >= MAX_WITHDRAWS_PER_DAY else ''}>Request Auto-Payout</button>
         </form>
         <p><a href="/history">View history</a> | <a href="/settings">Setup Telegram alerts</a></p>
     </div>
@@ -559,7 +623,7 @@ def admin():
         return redirect('/')
 
     cur.execute('''
-        SELECT w.id, w.amount, w.fee, w.net_amount, w.momo_number, w.status, w.request_date, u.email
+        SELECT w.id, w.amount, w.fee, w.net_amount, w.momo_number, w.status, w.request_date, w.momo_ref, u.email
         FROM withdrawals w
         JOIN users u ON w.user_id = u.id
         ORDER BY w.request_date DESC
@@ -573,7 +637,8 @@ def admin():
     rows = ''
     for w in withdrawals:
         status_color = '#28a745' if w['status'] == 'paid' else '#ffc107'
-        action = f'<a href="/pay/{w["id"]}" class="btn btn-green">Mark Paid</a>' if w['status'] == 'pending' else 'Done'
+        action = f'<a href="/pay/{w["id"]}" class="btn btn-green">Auto-Pay</a>' if w['status'] == 'pending' else 'Done'
+        momo_status = f'<br><span class="small">Ref: {w["momo_ref"]}</span>' if w['momo_ref'] else ''
         rows += f'''
         <tr>
             <td>{w['id']}</td>
@@ -581,7 +646,7 @@ def admin():
             <td>{w['net_amount']} FCFA</td>
             <td class="small">{w['fee']}</td>
             <td>{w['momo_number']}</td>
-            <td><span class="badge" style="background:{status_color}">{w['status']}</span></td>
+            <td><span class="badge" style="background:{status_color}">{w['status']}</span>{momo_status}</td>
             <td>{w['request_date'].strftime('%Y-%m-%d %H:%M')}</td>
             <td>{action}</td>
         </tr>
@@ -589,9 +654,9 @@ def admin():
 
     content = f'''
     <div class="card">
-        <h1>🔒 Admin Panel - Withdrawals</h1>
+        <h1>🔒 Admin Panel - Auto-Pay</h1>
         <p class="balance">Total Fees Earned: {total_fees} FCFA</p>
-        <p class="small">Platform earns {WITHDRAWAL_FEE_PERCENT}% on each withdrawal</p>
+        <p class="small">Platform earns {WITHDRAWAL_FEE_PERCENT}% | MTN API: {MTN_TARGET_ENV.upper()}</p>
         <table>
             <tr><th>ID</th><th>User</th><th>Net Pay</th><th>Fee</th><th>MoMo</th><th>Status</th><th>Date</th><th>Action</th></tr>
             {rows if rows else '<tr><td colspan="8">No withdrawal requests yet</td></tr>'}
@@ -616,24 +681,33 @@ def pay(wid):
         return redirect('/')
 
     cur.execute('''
-        SELECT w.net_amount, u.telegram_id, u.email
+        SELECT w.net_amount, w.momo_number, u.telegram_id, u.email
         FROM withdrawals w
         JOIN users u ON w.user_id = u.id
-        WHERE w.id=%s
+        WHERE w.id=%s AND w.status='pending'
     ''', (wid,))
     w_data = cur.fetchone()
 
-    cur.execute('UPDATE withdrawals SET status=%s WHERE id=%s', ('paid', wid))
-    conn.commit()
-    conn.close()
+    if not w_data:
+        conn.close()
+        flash('Withdrawal not found or already paid')
+        return redirect('/admin')
 
-    if w_data and w_data['telegram_id']:
-        msg = f"✅ <b>EarnLink Payout Complete</b>\n\nYour withdrawal of <b>{w_data['net_amount']} FCFA</b> has been paid to your MoMo.\n\nThanks for using EarnLink!"
-        send_telegram(w_data['telegram_id'], msg)
-        flash(f'Withdrawal #{wid} marked as paid + Telegram sent to {w_data["email"]}')
+    # PART 8: MTN MOMO AUTO-PAY
+    external_id = str(uuid.uuid4())
+    success, msg = send_momo_payment(w_data['net_amount'], w_data['momo_number'], external_id)
+
+    if success:
+        cur.execute('UPDATE withdrawals SET status=%s, momo_ref=%s WHERE id=%s', ('paid', external_id, wid))
+        conn.commit()
+        if w_data['telegram_id']:
+            tg_msg = f"✅ <b>EarnLink Auto-Payout Complete</b>\n\n<b>{w_data['net_amount']} FCFA</b> sent to {w_data['momo_number']}.\n\nCheck your MoMo balance!"
+            send_telegram(w_data['telegram_id'], tg_msg)
+        flash(f'✅ Auto-paid {w_data["net_amount"]} FCFA to {w_data["momo_number"]}. Ref: {external_id[:8]}')
     else:
-        flash(f'Withdrawal #{wid} marked as paid')
+        flash(f'❌ MTN API failed: {msg}. Mark manually or retry.')
 
+    conn.close()
     return redirect('/admin')
 
 @app.route('/logout')
