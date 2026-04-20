@@ -60,14 +60,14 @@ BASE_HTML = '''
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f5f5f5}
-     .card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
-     .btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
-     .btn-red{background:#dc3545}
-     .btn-green{background:#28a745}
+    .card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
+    .btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
+    .btn-red{background:#dc3545}
+    .btn-green{background:#28a745}
         input{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
-     .nav a{margin-right:15px;text-decoration:none;color:#0088cc}
+    .nav a{margin-right:15px;text-decoration:none;color:#0088cc}
         h1{color:#333;margin-top:0}
-     .balance{font-size:24px;color:#28a745;font-weight:bold}
+    .balance{font-size:24px;color:#28a745;font-weight:bold}
         table{width:100%;border-collapse:collapse}
         td,th{padding:8px;text-align:left;border-bottom:1px solid #ddd}
     </style>
@@ -77,6 +77,7 @@ BASE_HTML = '''
         <a href="/">Dashboard</a>
         <a href="/leaderboard">Leaderboard</a>
         <a href="/withdraw">Withdraw</a>
+        {% if session.user_id and is_admin %}<a href="/admin">Admin</a>{% endif %}
         {% if session.user_id %}<a href="/logout">Logout</a>{% endif %}
     </div>
     {% with messages = get_flashed_messages() %}
@@ -89,7 +90,16 @@ BASE_HTML = '''
 
 def render_page(content):
     from flask import render_template_string, session, get_flashed_messages
-    return render_template_string(BASE_HTML, content=content, session=session, get_flashed_messages=get_flashed_messages)
+    is_admin = False
+    if 'user_id' in session:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT email FROM users WHERE id=%s', (session['user_id'],))
+        user = cur.fetchone()
+        conn.close()
+        if user and user['email'] == 'admin@test.com':
+            is_admin = True
+    return render_template_string(BASE_HTML, content=content, session=session, is_admin=is_admin, get_flashed_messages=get_flashed_messages)
 
 @app.route('/')
 def home():
@@ -264,6 +274,78 @@ def leaderboard():
     </div>
     '''
     return render_page(content)
+
+@app.route('/admin')
+def admin():
+    if 'user_id' not in session:
+        return redirect('/login')
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT email FROM users WHERE id=%s', (session['user_id'],))
+    user = cur.fetchone()
+
+    if user['email']!= 'admin@test.com':
+        conn.close()
+        flash('Access denied')
+        return redirect('/')
+
+    cur.execute('''
+        SELECT w.id, w.amount, w.momo_number, w.status, w.request_date, u.email
+        FROM withdrawals w
+        JOIN users u ON w.user_id = u.id
+        ORDER BY w.request_date DESC
+    ''')
+    withdrawals = cur.fetchall()
+    conn.close()
+
+    rows = ''
+    for w in withdrawals:
+        status_color = '#28a745' if w['status'] == 'paid' else '#ffc107'
+        action = f'<a href="/pay/{w["id"]}" class="btn btn-green">Mark Paid</a>' if w['status'] == 'pending' else 'Done'
+        rows += f'''
+        <tr>
+            <td>{w['id']}</td>
+            <td>{w['email']}</td>
+            <td>{w['amount']} FCFA</td>
+            <td>{w['momo_number']}</td>
+            <td><span style="background:{status_color};color:white;padding:3px 8px;border-radius:3px">{w['status']}</span></td>
+            <td>{w['request_date'].strftime('%Y-%m-%d %H:%M')}</td>
+            <td>{action}</td>
+        </tr>
+        '''
+
+    content = f'''
+    <div class="card">
+        <h1>🔒 Admin Panel - Withdrawals</h1>
+        <table>
+            <tr><th>ID</th><th>User</th><th>Amount</th><th>MoMo</th><th>Status</th><th>Date</th><th>Action</th></tr>
+            {rows if rows else '<tr><td colspan="7">No withdrawal requests yet</td></tr>'}
+        </table>
+    </div>
+    '''
+    return render_page(content)
+
+@app.route('/pay/<int:wid>')
+def pay(wid):
+    if 'user_id' not in session:
+        return redirect('/login')
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT email FROM users WHERE id=%s', (session['user_id'],))
+    user = cur.fetchone()
+
+    if user['email']!= 'admin@test.com':
+        conn.close()
+        flash('Access denied')
+        return redirect('/')
+
+    cur.execute('UPDATE withdrawals SET status=%s WHERE id=%s', ('paid', wid))
+    conn.commit()
+    conn.close()
+    flash(f'Withdrawal #{wid} marked as paid')
+    return redirect('/admin')
 
 @app.route('/logout')
 def logout():
