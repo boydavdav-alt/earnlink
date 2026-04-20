@@ -1,22 +1,19 @@
 import os
 import sqlite3
-import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from flask import Flask, request, render_template_string, redirect, session, url_for
 from datetime import datetime
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-change-this')
 
 def init_db():
     conn = sqlite3.connect('earnlink.db')
     cursor = conn.cursor()
-    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE,
+            password TEXT,
             points INTEGER DEFAULT 0,
             referral_code TEXT UNIQUE,
             referred_by TEXT,
@@ -24,7 +21,6 @@ def init_db():
             join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS withdrawals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,31 +29,13 @@ def init_db():
             momo_number TEXT,
             status TEXT DEFAULT 'pending',
             request_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
+            FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS referral_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id INTEGER,
-            referred_id INTEGER,
-            points_awarded INTEGER DEFAULT 20,
-            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (referrer_id) REFERENCES users (user_id),
-            FOREIGN KEY (referred_id) REFERENCES users (user_id)
-        )
-    ''')
-    
     conn.commit()
     conn.close()
-    logger.info("Database initialized")
 
 init_db()
-
-TOKEN = os.environ.get('BOT_TOKEN')
-if not TOKEN:
-    raise ValueError("BOT_TOKEN environment variable not set!")
 
 def get_db():
     conn = sqlite3.connect('earnlink.db')
@@ -67,199 +45,219 @@ def get_db():
 def make_code(user_id):
     return f"EL{user_id}"
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-    username = user.username or "NoUsername"
-    first_name = user.first_name or "User"
-    
+# HTML TEMPLATE - All pages in one
+BASE_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>EarnLink</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f5f5f5}
+       .card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
+       .btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
+       .btn-red{background:#dc3545}
+       .btn-green{background:#28a745}
+        input{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
+       .nav a{margin-right:15px;text-decoration:none;color:#0088cc}
+        h1{color:#333;margin-top:0}
+       .balance{font-size:24px;color:#28a745;font-weight:bold}
+        table{width:100%;border-collapse:collapse}
+        td,th{padding:8px;text-align:left;border-bottom:1px solid #ddd}
+    </style>
+</head>
+<body>
+    <div class="nav card">
+        <a href="/">Dashboard</a>
+        <a href="/leaderboard">Leaderboard</a>
+        <a href="/withdraw">Withdraw</a>
+        {% if session.user_id %}<a href="/logout">Logout</a>{% endif %}
+    </div>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}<div class="card" style="background:#fff3cd;">{{ messages[0] }}</div>{% endif %}
+    {% endwith %}
+    {{ content|safe }}
+</body>
+</html>
+'''
+
+def render_page(content):
+    from flask import render_template_string, session, get_flashed_messages
+    return render_template_string(BASE_HTML, content=content, session=session, get_flashed_messages=get_flashed_messages)
+
+@app.route('/')
+def home():
+    if 'user_id' not in session:
+        return redirect('/login')
+
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id =?", (user_id,))
-    exists = cur.fetchone()
-    
-    if not exists:
-        ref_by_code = None
-        if context.args and len(context.args) > 0:
-            ref_by_code = context.args[0]
-            cur.execute("SELECT user_id FROM users WHERE referral_code =?", (ref_by_code,))
-            referrer = cur.fetchone()
-            if referrer and referrer['user_id']!= user_id:
-                referrer_id = referrer['user_id']
-                cur.execute("UPDATE users SET points = points + 20 WHERE user_id =?", (referrer_id,))
-                cur.execute("INSERT INTO referral_log (referrer_id, referred_id) VALUES (?,?)", (referrer_id, user_id))
-                logger.info(f"User {referrer_id} got 20 points for referring {user_id}")
-        
-        code = make_code(user_id)
-        cur.execute(
-            "INSERT INTO users (user_id, username, first_name, points, referral_code, referred_by) VALUES (?,?,?, 0,?,?)", 
-            (user_id, username, first_name, code, ref_by_code)
-        )
-        conn.commit()
-        
-        text = (
-            f"🎉 Welcome to EarnLink, {first_name}!\n\n"
-            f"💰 Earn 20 points for every friend you invite!\n\n"
-            f"🔗 Your referral link:\n"
-            f"https://t.me/EarnlinkMoneyBot?start={code}\n\n"
-            f"📱 Commands:\n"
-            f"/balance - Check your points\n"
-            f"/ref - Get your referral link\n"
-            f"/withdraw - Cash out to Mobile Money\n"
-            f"/leaderboard - Top earners"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("💰 Check Balance", callback_data='balance')],
-            [InlineKeyboardButton("🔗 Get Referral Link", callback_data='ref')]
-        ]
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        
-    else:
-        await update.message.reply_text(
-            f"👋 Welcome back, {first_name}!\n\n"
-            f"Use /balance to check points\n"
-            f"Use /ref to get your link\n"
-            f"Use /withdraw to cash out"
-        )
+    user = conn.execute('SELECT * FROM users WHERE id =?', (session['user_id'],)).fetchone()
     conn.close()
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message or update.callback_query.message
-    user_id = update.effective_user.id
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT points, referral_code FROM users WHERE user_id =?", (user_id,))
-    res = cur.fetchone()
-    conn.close()
-    
-    if res:
-        text = f"💰 Your Balance\n\nPoints: {res['points']}\nCode: {res['referral_code']}\n\n1 point = 1 FCFA\nMin withdrawal: 100 points"
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text)
-        else:
-            await msg.reply_text(text)
-    else:
-        await msg.reply_text("❌ Send /start first")
+    link = f"{request.host_url}join/{user['referral_code']}"
 
-async def ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message or update.callback_query.message
-    user_id = update.effective_user.id
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT referral_code, points FROM users WHERE user_id =?", (user_id,))
-    res = cur.fetchone()
-    conn.close()
-    
-    if res:
-        link = f"https://t.me/EarnlinkMoneyBot?start={res['referral_code']}"
-        text = f"🔗 Your Referral Link\n\n{link}\n\n📊 Points: {res['points']}\n20 points per friend!"
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text)
-        else:
-            await msg.reply_text(text)
-    else:
-        await msg.reply_text("❌ Send /start first")
+    content = f'''
+    <div class="card">
+        <h1>Welcome {user['email']}</h1>
+        <p>Your Balance:</p>
+        <p class="balance">{user['points']} Points</p>
+        <p>1 point = 1 FCFA | Min withdrawal: 100 points</p>
+    </div>
+    <div class="card">
+        <h3>🔗 Your Referral Link</h3>
+        <input value="{link}" readonly onclick="this.select()">
+        <p>Share this link. You get 20 points per friend who joins!</p>
+        <a href="/leaderboard" class="btn">🏆 Leaderboard</a>
+        <a href="/withdraw" class="btn btn-green">💰 Withdraw</a>
+    </div>
+    '''
+    return render_page(content)
 
-async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if len(context.args)!= 2:
-        await update.message.reply_text(
-            "❌ Wrong format!\n\n"
-            "✅ Use: /withdraw <points> <momo_number>\n"
-            "Example: /withdraw 100 677123456\n\n"
-            "Minimum: 100 points"
-        )
-        return
-    
-    try:
-        amount = int(context.args[0])
-        momo = context.args[1].strip()
-    except ValueError:
-        await update.message.reply_text("❌ Points must be a number. Example: /withdraw 100 677123456")
-        return
-
-    if amount < 100:
-        await update.message.reply_text("❌ Minimum withdrawal is 100 points.")
-        return
-    
-    if not momo.isdigit() or len(momo) < 9:
-        await update.message.reply_text("❌ Invalid MTN number. Example: 677123456")
-        return
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT points FROM users WHERE user_id =?", (user_id,))
-    res = cur.fetchone()
-    
-    if not res:
-        await update.message.reply_text("❌ Send /start first")
+@app.route('/login', methods=['GET','POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        conn = get_db()
+        user = conn.execute('SELECT * FROM users WHERE email=? AND password=?', (email, password)).fetchone()
         conn.close()
-        return
-    
-    pts = res['points']
-    if pts < amount:
-        await update.message.reply_text(f"❌ Not enough points.\n\nYour balance: {pts} points\nRequested: {amount} points")
+        if user:
+            session['user_id'] = user['id']
+            return redirect('/')
+        else:
+            from flask import flash
+            flash('Invalid email or password')
+
+    content = '''
+    <div class="card">
+        <h1>Login to EarnLink</h1>
+        <form method="post">
+            <input name="email" type="email" placeholder="Email" required>
+            <input name="password" type="password" placeholder="Password" required>
+            <button class="btn" type="submit">Login</button>
+        </form>
+        <p>New here? <a href="/register">Create account</a></p>
+    </div>
+    '''
+    return render_page(content)
+
+@app.route('/register', methods=['GET','POST'])
+def register():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        ref = request.args.get('ref')
+
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute('INSERT INTO users (email, password, referred_by) VALUES (?,?,?)', (email, password, ref))
+            user_id = cur.lastrowid
+            code = make_code(user_id)
+            cur.execute('UPDATE users SET referral_code=? WHERE id=?', (code, user_id))
+
+            # Give referrer 20 points
+            if ref:
+                referrer = conn.execute('SELECT id FROM users WHERE referral_code=?', (ref,)).fetchone()
+                if referrer:
+                    cur.execute('UPDATE users SET points = points + 20 WHERE id=?', (referrer['id'],))
+
+            conn.commit()
+            session['user_id'] = user_id
+            conn.close()
+            return redirect('/')
+        except sqlite3.IntegrityError:
+            conn.close()
+            from flask import flash
+            flash('Email already exists')
+
+    content = '''
+    <div class="card">
+        <h1>Create EarnLink Account</h1>
+        <form method="post">
+            <input name="email" type="email" placeholder="Email" required>
+            <input name="password" type="password" placeholder="Password" required>
+            <button class="btn" type="submit">Register</button>
+        </form>
+        <p>Have account? <a href="/login">Login</a></p>
+    </div>
+    '''
+    return render_page(content)
+
+@app.route('/join/<code>')
+def join(code):
+    return redirect(f'/register?ref={code}')
+
+@app.route('/withdraw', methods=['GET','POST'])
+def withdraw():
+    if 'user_id' not in session:
+        return redirect('/login')
+
+    if request.method == 'POST':
+        amount = int(request.form['amount'])
+        momo = request.form['momo']
+        conn = get_db()
+        user = conn.execute('SELECT points FROM users WHERE id=?', (session['user_id'],)).fetchone()
+
+        if amount < 100:
+            from flask import flash
+            flash('Minimum withdrawal is 100 points')
+        elif user['points'] < amount:
+            from flask import flash
+            flash(f'Not enough points. Balance: {user["points"]}')
+        else:
+            conn.execute('UPDATE users SET points = points -?, momo_number =? WHERE id =?',
+                         (amount, momo, session['user_id']))
+            conn.execute('INSERT INTO withdrawals (user_id, amount, momo_number) VALUES (?,?,?)',
+                         (session['user_id'], amount, momo))
+            conn.commit()
+            from flask import flash
+            flash(f'Withdrawal of {amount} FCFA requested. Paid within 24h.')
+
         conn.close()
-        return
-    
-    new_bal = pts - amount
-    cur.execute("UPDATE users SET points =?, momo_number =? WHERE user_id =?", (new_bal, momo, user_id))
-    cur.execute("INSERT INTO withdrawals (user_id, amount, momo_number) VALUES (?,?,?)", (user_id, amount, momo))
-    conn.commit()
-    conn.close()
-    
-    await update.message.reply_text(
-        f"✅ Withdrawal Requested!\n\n"
-        f"💰 Amount: {amount} FCFA\n"
-        f"📱 MTN MoMo: {momo}\n"
-        f"📊 New Balance: {new_bal} points\n"
-        f"⏰ Status: Pending\n\n"
-        f"Paid within 24 hours."
-    )
-    logger.info(f"Withdrawal: User {user_id} requested {amount} to {momo}")
+        return redirect('/withdraw')
 
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT username, first_name, points FROM users ORDER BY points DESC LIMIT 10")
-    top = cur.fetchall()
+    user = conn.execute('SELECT points FROM users WHERE id=?', (session['user_id'],)).fetchone()
     conn.close()
-    
-    if not top:
-        await update.message.reply_text("No users yet. Be the first!")
-        return
-    
-    text = "🏆 Top 10 Earners\n\n"
-    for i, u in enumerate(top, 1):
-        name = u['first_name'] or u['username'] or "Anonymous"
-        text += f"{i}. {name} - {u['points']} points\n"
-    
-    await update.message.reply_text(text)
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == 'balance':
-        await balance(update, context)
-    elif query.data == 'ref':
-        await ref(update, context)
+    content = f'''
+    <div class="card">
+        <h1>💰 Withdraw</h1>
+        <p>Current Balance: <b>{user['points']} points</b></p>
+        <form method="post">
+            <input name="amount" type="number" placeholder="Amount (min 100)" min="100" required>
+            <input name="momo" placeholder="MTN MoMo Number: 677123456" required>
+            <button class="btn btn-green" type="submit">Request Withdrawal</button>
+        </form>
+    </div>
+    '''
+    return render_page(content)
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}")
+@app.route('/leaderboard')
+def leaderboard():
+    conn = get_db()
+    top = conn.execute('SELECT email, points FROM users ORDER BY points DESC LIMIT 10').fetchall()
+    conn.close()
 
-def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("ref", ref))
-    app.add_handler(CommandHandler("withdraw", withdraw))
-    app.add_handler(CommandHandler("leaderboard", leaderboard))
-    app.add_handler(CallbackQueryHandler(button))
-    app.add_error_handler(error_handler)
-    logger.info("Bot starting...")
-    app.run_polling(drop_pending_updates=True)
+    rows = ''.join([f'<tr><td>{i+1}</td><td>{u["email"]}</td><td>{u["points"]}</td></tr>' for i,u in enumerate(top)])
+
+    content = f'''
+    <div class="card">
+        <h1>🏆 Top 10 Earners</h1>
+        <table>
+            <tr><th>#</th><th>User</th><th>Points</th></tr>
+            {rows if rows else '<tr><td colspan="3">No users yet</td></tr>'}
+        </table>
+    </div>
+    '''
+    return render_page(content)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/login')
 
 if __name__ == '__main__':
-    main()
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
