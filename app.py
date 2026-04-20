@@ -3,7 +3,7 @@ import psycopg2
 from psycopg2.extras import DictCursor
 from flask import Flask, request, render_template_string, redirect, session, url_for, flash
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
+from datetime import datetime, timedelta
 import urllib.parse
 import requests
 
@@ -11,10 +11,13 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-change-this')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 
-# PART 5: Fee config - change if you want
-WITHDRAWAL_FEE_PERCENT = 2 # 2% fee on withdrawals
-LEVEL_1_REWARD = 20 # Direct referral
-LEVEL_2_REWARD = 5 # Referral of referral
+# PART 5 + 6 CONFIG
+WITHDRAWAL_FEE_PERCENT = 2
+LEVEL_1_REWARD = 20
+LEVEL_2_REWARD = 5
+MAX_WITHDRAWS_PER_DAY = 1 # PART 6: Anti-spam
+MIN_WITHDRAW = 100
+MAX_WITHDRAW = 5000 # PART 6: Cap single withdrawal
 
 def send_telegram(telegram_id, message):
     if not TELEGRAM_TOKEN or not telegram_id:
@@ -60,7 +63,6 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
-    # Add new columns if missing - safe migration
     cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='telegram_id'")
     if not cursor.fetchone():
         cursor.execute("ALTER TABLE users ADD COLUMN telegram_id TEXT")
@@ -148,7 +150,7 @@ def home():
     conn.close()
 
     link = f"{request.host_url}join/{user['referral_code']}"
-    wa_text = urllib.parse.quote(f"🔥 Join EarnLink and we both get 20 FCFA! Level 2 = 5 FCFA bonus 💰\n\nUse my link: {link}")
+    wa_text = urllib.parse.quote(f"🔥 Join EarnLink and we both get {LEVEL_1_REWARD} FCFA! Level 2 = {LEVEL_2_REWARD} FCFA bonus 💰\n\nUse my link: {link}")
     wa_link = f"https://wa.me/?text={wa_text}"
 
     content = f'''
@@ -156,7 +158,7 @@ def home():
         <h1>Welcome {user['email']}</h1>
         <p>Your Balance:</p>
         <p class="balance">{user['points']} Points</p>
-        <p>1 point = 1 FCFA | Min withdrawal: 100 points | Fee: {WITHDRAWAL_FEE_PERCENT}%</p>
+        <p>1 point = 1 FCFA | Min: {MIN_WITHDRAW} | Max: {MAX_WITHDRAW} | Fee: {WITHDRAWAL_FEE_PERCENT}%</p>
     </div>
     <div class="card">
         <h3>🔗 Your Referral Link</h3>
@@ -254,14 +256,11 @@ def register():
             code = make_code(user_id)
             cur.execute('UPDATE users SET referral_code=%s WHERE id=%s', (code, user_id))
 
-            # PART 5: 2-LEVEL REFERRAL SYSTEM
             if ref:
-                # Level 1: Direct referrer gets 20
                 cur.execute('SELECT id, referred_by FROM users WHERE referral_code=%s', (ref,))
                 level1 = cur.fetchone()
                 if level1:
                     cur.execute('UPDATE users SET points = points + %s WHERE id=%s', (LEVEL_1_REWARD, level1['id']))
-                    # Level 2: Referrer's referrer gets 5
                     if level1['referred_by']:
                         cur.execute('SELECT id FROM users WHERE referral_code=%s', (level1['referred_by'],))
                         level2 = cur.fetchone()
@@ -303,7 +302,20 @@ def withdraw():
     cur.execute('SELECT points FROM users WHERE id=%s', (session['user_id'],))
     user = cur.fetchone()
 
+    # PART 6: Check daily withdrawal limit
+    cur.execute('''
+        SELECT COUNT(*) as cnt FROM withdrawals
+        WHERE user_id=%s AND request_date > NOW() - INTERVAL '24 hours'
+    ''', (session['user_id'],))
+    withdraw_count = cur.fetchone()['cnt']
+
     if request.method == 'POST':
+        # PART 6: Block if limit reached
+        if withdraw_count >= MAX_WITHDRAWS_PER_DAY:
+            flash(f'Daily limit reached. Max {MAX_WITHDRAWS_PER_DAY} withdrawal per 24 hours.')
+            conn.close()
+            return redirect('/withdraw')
+
         try:
             amount = int(request.form['amount'])
         except:
@@ -313,8 +325,12 @@ def withdraw():
 
         momo = request.form['momo']
 
-        if amount < 100:
-            flash('Minimum withdrawal is 100 points')
+        if amount < MIN_WITHDRAW:
+            flash(f'Minimum withdrawal is {MIN_WITHDRAW} points')
+            conn.close()
+            return redirect('/withdraw')
+        if amount > MAX_WITHDRAW:
+            flash(f'Maximum withdrawal is {MAX_WITHDRAW} points')
             conn.close()
             return redirect('/withdraw')
         if user['points'] < amount:
@@ -326,13 +342,12 @@ def withdraw():
             conn.close()
             return redirect('/withdraw')
 
-        # PART 5: Calculate 2% fee
         fee = (amount * WITHDRAWAL_FEE_PERCENT) // 100
         net_amount = amount - fee
 
         cur.execute('UPDATE users SET points = points - %s, momo_number = %s WHERE id = %s',
                      (amount, momo, session['user_id']))
-        cur.execute('INSERT INTO withdrawals (user_id, amount, fee, net_amount, momo_number) VALUES (%s,%s,%s)',
+        cur.execute('INSERT INTO withdrawals (user_id, amount, fee, net_amount, momo_number) VALUES (%s,%s,%s,%s,%s)',
                      (session['user_id'], amount, fee, net_amount, momo))
         conn.commit()
         flash(f'Withdrawal of {net_amount} FCFA requested. Fee: {fee} FCFA. Paid within 24h.')
@@ -340,15 +355,18 @@ def withdraw():
         return redirect('/withdraw')
 
     conn.close()
+    limit_msg = f'<p class="small">Daily limit: {MAX_WITHDRAWS_PER_DAY} withdrawal. You have {MAX_WITHDRAWS_PER_DAY - withdraw_count} left today.</p>'
+
     content = f'''
     <div class="card">
-        <h1>💰 Withdraw V5 - FEES + LEVELS</h1>
+        <h1>💰 Withdraw V6 - DAILY LIMIT</h1>
         <p>Current Balance: <b>{user['points']} points</b></p>
-        <p class="small">Fee: {WITHDRAWAL_FEE_PERCENT}% deducted. You receive 98% of amount.</p>
+        <p class="small">Min: {MIN_WITHDRAW} | Max: {MAX_WITHDRAW} | Fee: {WITHDRAWAL_FEE_PERCENT}%</p>
+        {limit_msg}
         <form method="post">
-            <input name="amount" type="number" placeholder="Amount (min 100)" min="100" max="{user['points']}" required>
-            <input name="momo" placeholder="MTN MoMo Number: 677123456" required>
-            <button class="btn btn-green" type="submit">Request Withdrawal</button>
+            <input name="amount" type="number" placeholder="Amount ({MIN_WITHDRAW}-{MAX_WITHDRAW})" min="{MIN_WITHDRAW}" max="{min(MAX_WITHDRAW, user['points'])}" required {'disabled' if withdraw_count >= MAX_WITHDRAWS_PER_DAY else ''}>
+            <input name="momo" placeholder="MTN MoMo Number: 677123456" required {'disabled' if withdraw_count >= MAX_WITHDRAWS_PER_DAY else ''}>
+            <button class="btn btn-green" type="submit" {'disabled' if withdraw_count >= MAX_WITHDRAWS_PER_DAY else ''}>Request Withdrawal</button>
         </form>
         <p><a href="/history">View history</a> | <a href="/settings">Setup Telegram alerts</a></p>
     </div>
@@ -442,6 +460,10 @@ def admin():
         ORDER BY w.request_date DESC
     ''')
     withdrawals = cur.fetchall()
+
+    # PART 6: Calculate total fees earned
+    cur.execute("SELECT COALESCE(SUM(fee), 0) as total_fees FROM withdrawals WHERE status='paid'")
+    total_fees = cur.fetchone()['total_fees']
     conn.close()
 
     rows = ''
@@ -453,7 +475,7 @@ def admin():
             <td>{w['id']}</td>
             <td>{w['email']}</td>
             <td>{w['net_amount']} FCFA</td>
-            <td class="small">Fee: {w['fee']}</td>
+            <td class="small">{w['fee']}</td>
             <td>{w['momo_number']}</td>
             <td><span class="badge" style="background:{status_color}">{w['status']}</span></td>
             <td>{w['request_date'].strftime('%Y-%m-%d %H:%M')}</td>
@@ -464,6 +486,7 @@ def admin():
     content = f'''
     <div class="card">
         <h1>🔒 Admin Panel - Withdrawals</h1>
+        <p class="balance">Total Fees Earned: {total_fees} FCFA</p>
         <p class="small">Platform earns {WITHDRAWAL_FEE_PERCENT}% on each withdrawal</p>
         <table>
             <tr><th>ID</th><th>User</th><th>Net Pay</th><th>Fee</th><th>MoMo</th><th>Status</th><th>Date</th><th>Action</th></tr>
