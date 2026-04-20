@@ -165,8 +165,7 @@ def login():
   if user and check_password_hash(user['password'],password):
    session['user_id']=user['id']
    return redirect('/')
-  else:
-   flash('Invalid email or password')
+  else:flash('Invalid email or password')
  content='''<div class="card"><h1>Login to EarnLink</h1><form method="post"><input name="email" type="email" placeholder="Email" required><input name="password" type="password" placeholder="Password" required><button class="btn" type="submit">Login</button></form><p><a href="/forgot">Forgot Password?</a></p><p>New here? <a href="/register">Create account</a></p></div>'''
  return render_page(content)
 @app.route('/forgot',methods=['GET','POST'])
