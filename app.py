@@ -9,7 +9,7 @@ app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-change-this')
 
 def get_db():
     DATABASE_URL = os.environ.get('DATABASE_URL')
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=DictCursor)
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require', cursor_factory=DictCursor)
     return conn
 
 def init_db():
@@ -60,14 +60,14 @@ BASE_HTML = '''
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f5f5f5}
-      .card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
-      .btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
-      .btn-red{background:#dc3545}
-      .btn-green{background:#28a745}
+     .card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
+     .btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
+     .btn-red{background:#dc3545}
+     .btn-green{background:#28a745}
         input{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
-      .nav a{margin-right:15px;text-decoration:none;color:#0088cc}
+     .nav a{margin-right:15px;text-decoration:none;color:#0088cc}
         h1{color:#333;margin-top:0}
-      .balance{font-size:24px;color:#28a745;font-weight:bold}
+     .balance{font-size:24px;color:#28a745;font-weight:bold}
         table{width:100%;border-collapse:collapse}
         td,th{padding:8px;text-align:left;border-bottom:1px solid #ddd}
     </style>
