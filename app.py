@@ -1,17 +1,23 @@
 import os
-import sqlite3
-from flask import Flask, request, render_template_string, redirect, session, url_for
+import psycopg2
+from psycopg2.extras import DictCursor
+from flask import Flask, request, render_template_string, redirect, session, url_for, flash
 from datetime import datetime
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-change-this')
 
+def get_db():
+    DATABASE_URL = os.environ.get('DATABASE_URL')
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=DictCursor)
+    return conn
+
 def init_db():
-    conn = sqlite3.connect('earnlink.db')
+    conn = get_db()
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             email TEXT UNIQUE,
             password TEXT,
             points INTEGER DEFAULT 0,
@@ -23,7 +29,7 @@ def init_db():
     ''')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER,
             amount INTEGER,
             momo_number TEXT,
@@ -32,15 +38,15 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    # Create admin if not exists
+    cursor.execute("SELECT * FROM users WHERE email=%s", ('admin@test.com',))
+    if cursor.fetchone() is None:
+        cursor.execute("INSERT INTO users (email, password, points, referral_code) VALUES (%s, %s, %s, %s)",
+                     ('admin@test.com', '123', 0, 'EL1'))
     conn.commit()
     conn.close()
 
 init_db()
-
-def get_db():
-    conn = sqlite3.connect('earnlink.db')
-    conn.row_factory = sqlite3.Row
-    return conn
 
 def make_code(user_id):
     return f"EL{user_id}"
@@ -54,14 +60,14 @@ BASE_HTML = '''
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f5f5f5}
-       .card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
-       .btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
-       .btn-red{background:#dc3545}
-       .btn-green{background:#28a745}
+      .card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
+      .btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
+      .btn-red{background:#dc3545}
+      .btn-green{background:#28a745}
         input{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
-       .nav a{margin-right:15px;text-decoration:none;color:#0088cc}
+      .nav a{margin-right:15px;text-decoration:none;color:#0088cc}
         h1{color:#333;margin-top:0}
-       .balance{font-size:24px;color:#28a745;font-weight:bold}
+      .balance{font-size:24px;color:#28a745;font-weight:bold}
         table{width:100%;border-collapse:collapse}
         td,th{padding:8px;text-align:left;border-bottom:1px solid #ddd}
     </style>
@@ -91,7 +97,9 @@ def home():
         return redirect('/login')
 
     conn = get_db()
-    user = conn.execute('SELECT * FROM users WHERE id =?', (session['user_id'],)).fetchone()
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM users WHERE id =%s', (session['user_id'],))
+    user = cur.fetchone()
     conn.close()
 
     link = f"{request.host_url}join/{user['referral_code']}"
@@ -119,13 +127,14 @@ def login():
         email = request.form['email']
         password = request.form['password']
         conn = get_db()
-        user = conn.execute('SELECT * FROM users WHERE email=? AND password=?', (email, password)).fetchone()
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM users WHERE email=%s AND password=%s', (email, password))
+        user = cur.fetchone()
         conn.close()
         if user:
             session['user_id'] = user['id']
             return redirect('/')
         else:
-            from flask import flash
             flash('Invalid email or password')
 
     content = '''
@@ -151,24 +160,24 @@ def register():
         conn = get_db()
         try:
             cur = conn.cursor()
-            cur.execute('INSERT INTO users (email, password, referred_by) VALUES (?,?,?)', (email, password, ref))
-            user_id = cur.lastrowid
+            cur.execute('INSERT INTO users (email, password, referred_by) VALUES (%s,%s,%s) RETURNING id', (email, password, ref))
+            user_id = cur.fetchone()['id']
             code = make_code(user_id)
-            cur.execute('UPDATE users SET referral_code=? WHERE id=?', (code, user_id))
+            cur.execute('UPDATE users SET referral_code=%s WHERE id=%s', (code, user_id))
 
             # Give referrer 20 points
             if ref:
-                referrer = conn.execute('SELECT id FROM users WHERE referral_code=?', (ref,)).fetchone()
+                cur.execute('SELECT id FROM users WHERE referral_code=%s', (ref,))
+                referrer = cur.fetchone()
                 if referrer:
-                    cur.execute('UPDATE users SET points = points + 20 WHERE id=?', (referrer['id'],))
+                    cur.execute('UPDATE users SET points = points + 20 WHERE id=%s', (referrer['id'],))
 
             conn.commit()
             session['user_id'] = user_id
             conn.close()
             return redirect('/')
-        except sqlite3.IntegrityError:
+        except psycopg2.IntegrityError:
             conn.close()
-            from flask import flash
             flash('Email already exists')
 
     content = '''
@@ -197,28 +206,29 @@ def withdraw():
         amount = int(request.form['amount'])
         momo = request.form['momo']
         conn = get_db()
-        user = conn.execute('SELECT points FROM users WHERE id=?', (session['user_id'],)).fetchone()
+        cur = conn.cursor()
+        cur.execute('SELECT points FROM users WHERE id=%s', (session['user_id'],))
+        user = cur.fetchone()
 
         if amount < 100:
-            from flask import flash
             flash('Minimum withdrawal is 100 points')
         elif user['points'] < amount:
-            from flask import flash
             flash(f'Not enough points. Balance: {user["points"]}')
         else:
-            conn.execute('UPDATE users SET points = points -?, momo_number =? WHERE id =?',
+            cur.execute('UPDATE users SET points = points - %s, momo_number = %s WHERE id = %s',
                          (amount, momo, session['user_id']))
-            conn.execute('INSERT INTO withdrawals (user_id, amount, momo_number) VALUES (?,?,?)',
+            cur.execute('INSERT INTO withdrawals (user_id, amount, momo_number) VALUES (%s,%s,%s)',
                          (session['user_id'], amount, momo))
             conn.commit()
-            from flask import flash
             flash(f'Withdrawal of {amount} FCFA requested. Paid within 24h.')
 
         conn.close()
         return redirect('/withdraw')
 
     conn = get_db()
-    user = conn.execute('SELECT points FROM users WHERE id=?', (session['user_id'],)).fetchone()
+    cur = conn.cursor()
+    cur.execute('SELECT points FROM users WHERE id=%s', (session['user_id'],))
+    user = cur.fetchone()
     conn.close()
 
     content = f'''
@@ -237,7 +247,9 @@ def withdraw():
 @app.route('/leaderboard')
 def leaderboard():
     conn = get_db()
-    top = conn.execute('SELECT email, points FROM users ORDER BY points DESC LIMIT 10').fetchall()
+    cur = conn.cursor()
+    cur.execute('SELECT email, points FROM users ORDER BY points DESC LIMIT 10')
+    top = cur.fetchall()
     conn.close()
 
     rows = ''.join([f'<tr><td>{i+1}</td><td>{u["email"]}</td><td>{u["points"]}</td></tr>' for i,u in enumerate(top)])
