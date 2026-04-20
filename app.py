@@ -60,14 +60,14 @@ BASE_HTML = '''
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f5f5f5}
-   .card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
-   .btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
-   .btn-red{background:#dc3545}
-   .btn-green{background:#28a745}
+  .card{background:white;padding:20px;border-radius:8px;margin-bottom:15px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
+  .btn{background:#0088cc;color:white;padding:10px 15px;border:none;border-radius:5px;text-decoration:none;display:inline-block;margin:5px 5px 5px 0}
+  .btn-red{background:#dc3545}
+  .btn-green{background:#28a745}
         input{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:5px;box-sizing:border-box}
-   .nav a{margin-right:15px;text-decoration:none;color:#0088cc}
+  .nav a{margin-right:15px;text-decoration:none;color:#0088cc}
         h1{color:#333;margin-top:0}
-   .balance{font-size:24px;color:#28a745;font-weight:bold}
+  .balance{font-size:24px;color:#28a745;font-weight:bold}
         table{width:100%;border-collapse:collapse}
         td,th{padding:8px;text-align:left;border-bottom:1px solid #ddd}
     </style>
@@ -212,43 +212,50 @@ def withdraw():
     if 'user_id' not in session:
         return redirect('/login')
 
-    if request.method == 'POST':
-        amount = int(request.form['amount'])
-        momo = request.form['momo']
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT points FROM users WHERE id=%s', (session['user_id'],))
-        user = cur.fetchone()
-
-        # BUG FIX 1: Stop execution after error flash
-        if amount < 100:
-            flash('Minimum withdrawal is 100 points')
-            conn.close()
-            return redirect('/withdraw')
-        elif user['points'] < amount:
-            flash(f'Not enough points. Balance: {user["points"]}')
-            conn.close()
-            return redirect('/withdraw')
-        else:
-            cur.execute('UPDATE users SET points = points - %s, momo_number = %s WHERE id = %s',
-                         (amount, momo, session['user_id']))
-            cur.execute('INSERT INTO withdrawals (user_id, amount, momo_number) VALUES (%s,%s,%s)',
-                         (session['user_id'], amount, momo))
-            conn.commit()
-            flash(f'Withdrawal of {amount} FCFA requested. Paid within 24h.')
-            conn.close()
-            return redirect('/withdraw')
-
     conn = get_db()
     cur = conn.cursor()
     cur.execute('SELECT points FROM users WHERE id=%s', (session['user_id'],))
     user = cur.fetchone()
-    conn.close()
 
-    # BUG FIX 2: Add max attribute so user can't type more than balance
+    if request.method == 'POST':
+        try:
+            amount = int(request.form['amount'])
+        except:
+            flash('Invalid amount')
+            conn.close()
+            return redirect('/withdraw')
+
+        momo = request.form['momo']
+
+        # BULLETPROOF CHECK: Fail fast and return
+        if amount < 100:
+            flash('Minimum withdrawal is 100 points')
+            conn.close()
+            return redirect('/withdraw')
+        if user['points'] < amount:
+            flash(f'Not enough points. Balance: {user["points"]}')
+            conn.close()
+            return redirect('/withdraw')
+        if not momo:
+            flash('MTN MoMo number required')
+            conn.close()
+            return redirect('/withdraw')
+
+        # Only reaches here if all checks pass
+        cur.execute('UPDATE users SET points = points - %s, momo_number = %s WHERE id = %s',
+                     (amount, momo, session['user_id']))
+        cur.execute('INSERT INTO withdrawals (user_id, amount, momo_number) VALUES (%s,%s,%s)',
+                     (session['user_id'], amount, momo))
+        conn.commit()
+        flash(f'Withdrawal of {amount} FCFA requested. Paid within 24h.')
+        conn.close()
+        return redirect('/withdraw')
+
+    conn.close()
+    # V3 marker so you know this version is live
     content = f'''
     <div class="card">
-        <h1>💰 Withdraw</h1>
+        <h1>💰 Withdraw V3 - BALANCE CHECK</h1>
         <p>Current Balance: <b>{user['points']} points</b></p>
         <form method="post">
             <input name="amount" type="number" placeholder="Amount (min 100)" min="100" max="{user['points']}" required>
